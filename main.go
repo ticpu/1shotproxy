@@ -233,8 +233,12 @@ func (pi *ProxyInstance) parseArguments() {
 		pi.CacheLocation = fmt.Sprintf("/tmp/%s", ProgramName)
 	}
 
-	flag.StringVar(&(pi.ListenAddress), "listen", ":26557", "listen address and port")
-	flag.StringVar(&(pi.ConnectPort), "connect-port", ":26556", "port to use for outgoing connection")
+	logLevel := flag.String("log-level", "info",
+		"log level between trace, debug, info, warn, error, fatal, panic")
+	flag.StringVar(&(pi.ListenAddress), "listen", ":26557",
+		"listen address and port")
+	flag.StringVar(&(pi.ConnectPort), "connect-port", ":26556",
+		"port to use for outgoing connection")
 	flag.StringVar(&(pi.CacheLocation), "cache-dir", pi.CacheLocation,
 		"directory to store cached data (RUNTIME_DIRECTORY environment variable)")
 	pi.CacheFreshTime = flag.Duration("cache-fresh-time", 15*time.Second,
@@ -242,7 +246,12 @@ func (pi *ProxyInstance) parseArguments() {
 	pi.CacheStaleTime = flag.Duration("cache-stale-time", 5*time.Minute,
 		"how often to clean cache files")
 	flag.Parse()
-	log.SetLevel(log.DebugLevel)
+
+	logLevelValue, err := log.ParseLevel(*logLevel)
+	if err != nil {
+		log.Fatalf("invalid log level %s", *logLevel)
+	}
+	log.SetLevel(logLevelValue)
 
 	if pi.CacheTimeoutSeconds > 0 && !isDirectory(pi.CacheLocation) {
 		log.Fatalf("%s is not a valid directory", pi.CacheLocation)
