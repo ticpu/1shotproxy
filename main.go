@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/cakturk/go-netstat/netstat"
 	"github.com/gosimple/slug"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -25,7 +24,6 @@ const (
 	SocketDeadline   = 30 * time.Second
 )
 
-type TCPSockType func(netstat.AcceptFn) ([]netstat.SockTabEntry, error)
 type ProxyInstance struct {
 	ListenAddress       string
 	ConnectPort         string
@@ -35,6 +33,7 @@ type ProxyInstance struct {
 	CacheStaleTime      *time.Duration
 	CacheFreshTime      *time.Duration
 }
+
 type ProxiedConnection struct {
 	proxyInstance *ProxyInstance
 	inbound       net.Conn
@@ -200,17 +199,41 @@ func (conn *ProxiedConnection) proxyAndCache() {
 	}
 }
 
+func GetFdFromConn(conn net.Conn) (int, error) {
+	var tcpSocket *net.TCPConn
+	var socketFd *os.File
+	var err error
+	var ok bool
+
+	if tcpSocket, ok = conn.(*net.TCPConn); !ok {
+		return -1, fmt.Errorf("socket is not TCP")
+	}
+	if socketFd, err = tcpSocket.File(); err != nil {
+		return -1, err
+	}
+
+	return int(socketFd.Fd()), nil
+}
+
 func (conn *ProxiedConnection) acceptProxiedConnection() {
 	defer conn.destroy()
 	var err error
+	var socketFd int
+	var outboundIP *net.Addr
 
-	if conn.outboundIP, err = findRedirectedConnection(conn.inbound.RemoteAddr()); err != nil {
-		log.Warningf("couldn't find proxied connection: %s", err)
+	if socketFd, err = GetFdFromConn(conn.inbound); err != nil {
+		log.Warningf("unable to get file descriptor from socket: %s", err)
 		return
-	} else {
-		conn.outboundIP = strings.Replace(conn.outboundIP, ":26557", ":26556", 1)
+	}
+	if outboundIP, err = GetSockOptInet4(socketFd, unix.IPPROTO_IP, SO_ORIGINAL_DST); err != nil {
+		if outboundIP, err = GetSockOptInet6(socketFd, unix.IPPROTO_IPV6, SO_ORIGINAL_DST); err != nil {
+			log.Warningf("couldn't find proxied connection: %s", err)
+			return
+		}
 	}
 
+	log.Infof("outbound to %s", *outboundIP)
+	conn.outboundIP = strings.Replace((*outboundIP).String(), ":26557", ":26556", 1)
 	conn.proxyAndCache()
 }
 
@@ -258,38 +281,6 @@ func (pi *ProxyInstance) parseArguments() {
 	}
 }
 
-func filterEstablishedTcpForIpPort(searchIP net.IP, searchPort uint16) netstat.AcceptFn {
-	return func(entry *netstat.SockTabEntry) bool {
-		return entry.State == netstat.Established &&
-			entry.LocalAddr.IP.Equal(searchIP) &&
-			entry.LocalAddr.Port == searchPort
-	}
-}
-
-func findRedirectedConnection(connectionAddress net.Addr) (string, error) {
-	var err error
-	var connectionList []netstat.SockTabEntry
-	var tcpConnectionAddr = connectionAddress.(*net.TCPAddr)
-
-	for sockName, tcpSockType := range map[string]TCPSockType{"tcp4": netstat.TCPSocks, "tcp6": netstat.TCP6Socks} {
-		connectionList, err = tcpSockType(
-			filterEstablishedTcpForIpPort(tcpConnectionAddr.IP, uint16(tcpConnectionAddr.Port)))
-
-		if err != nil {
-			return "", err
-		} else if len(connectionList) > 0 {
-			log.Infof("outgoing %s: %s -> %s",
-				sockName,
-				tcpConnectionAddr.String(),
-				connectionList[0].RemoteAddr,
-			)
-			return connectionList[0].RemoteAddr.String(), nil
-		}
-	}
-
-	return "", nil
-}
-
 func (pi *ProxyInstance) newProxyConnection(inbound net.Conn) *ProxiedConnection {
 	var conn = pi.ProxyPool.Get().(*ProxiedConnection)
 	conn.proxyInstance = pi
@@ -331,14 +322,13 @@ func (pi *ProxyInstance) freeProxyConnection(conn *ProxiedConnection) {
 func (pi *ProxyInstance) openListeningSocket() net.Listener {
 	listenerConfig := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
-			var opErr error
 			err := c.Control(func(fd uintptr) {
-				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
 			})
 			if err != nil {
 				return err
 			}
-			return opErr
+			return nil
 		},
 	}
 
@@ -356,8 +346,9 @@ func (pi *ProxyInstance) dispatchConnections(listenSocket net.Listener) {
 	var err error
 	var newConnection net.Conn
 
+	log.Debugf("waiting for connection...")
+
 	for {
-		log.Debugf("waiting for connection...")
 		newConnection, err = listenSocket.Accept()
 
 		if err == nil {
@@ -418,6 +409,7 @@ func main() {
 			return conn
 		},
 	}
+
 	go cleanStaleFiles(pi.CacheLocation, *pi.CacheStaleTime)
 	listenSocket := pi.openListeningSocket()
 	pi.dispatchConnections(listenSocket)
